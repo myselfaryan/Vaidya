@@ -7,6 +7,9 @@ A comprehensive medical chatbot system that provides accurate healthcare informa
 - **Medical Knowledge Base**: Processes authoritative medical documents and creates semantic embeddings
 - **RAG Architecture**: Combines vector search with LLM generation for accurate responses
 - **Real-time Chat**: WebSocket-based chat interface with typing indicators
+- **Symptom Checker**: AI-powered symptom analysis with urgency assessment
+- **Emergency Information**: Quick access to emergency contacts and red flag symptoms
+- **User Management**: Complete authentication and profile management system
 - **Medical Compliance**: HIPAA-compliant with appropriate medical disclaimers
 - **Mobile-First**: Responsive design with PWA capabilities
 - **Multi-modal**: Text and voice input support
