@@ -4,8 +4,10 @@ Vector database service for medical document embeddings and retrieval.
 
 import json
 import uuid
+import hashlib
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+from functools import lru_cache
 
 import pinecone
 import numpy as np
@@ -14,6 +16,7 @@ from loguru import logger
 
 from ..core.config import settings
 from ..models.schemas import DocumentSearch
+from ..utils.document_processor import DocumentProcessor
 
 
 class VectorService:
@@ -23,6 +26,10 @@ class VectorService:
         """Initialize the vector service."""
         self.embedding_model = None
         self.index = None
+        self.document_processor = DocumentProcessor(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap
+        )
         self._initialize_pinecone()
         self._load_embedding_model()
     
@@ -62,23 +69,76 @@ class VectorService:
             logger.error(f"Failed to load embedding model: {e}")
             raise
     
-    def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+    @lru_cache(maxsize=1000)
+    def _get_text_hash(self, text: str) -> str:
+        """Generate a hash for text to use as cache key."""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+        
+    def generate_embeddings(
+        self, 
+        texts: List[str], 
+        use_cache: bool = True
+    ) -> List[List[float]]:
         """
-        Generate embeddings for a list of texts.
+        Generate embeddings for a list of texts with optional caching.
         
         Args:
             texts: List of text strings to embed
+            use_cache: Whether to use cached embeddings if available
             
         Returns:
             List of embedding vectors
         """
         try:
-            embeddings = self.embedding_model.encode(
-                texts,
-                normalize_embeddings=True,
-                show_progress_bar=True
-            )
-            return embeddings.tolist()
+            if not texts:
+                return []
+                
+            # Check cache for existing embeddings
+            cached_embeddings = []
+            uncached_texts = []
+            text_to_idx = {}
+            
+            if use_cache:
+                for i, text in enumerate(texts):
+                    text_hash = self._get_text_hash(text)
+                    if text_hash in self._embedding_cache:
+                        cached_embeddings.append(self._embedding_cache[text_hash])
+                    else:
+                        uncached_texts.append(text)
+                        text_to_idx[text] = i
+            else:
+                uncached_texts = texts
+                text_to_idx = {text: i for i, text in enumerate(texts)}
+            
+            # Generate embeddings for uncached texts
+            if uncached_texts:
+                new_embeddings = self.embedding_model.encode(
+                    uncached_texts,
+                    normalize_embeddings=True,
+                    show_progress_bar=len(uncached_texts) > 10,
+                    batch_size=32,
+                    convert_to_numpy=True
+                )
+                
+                if len(new_embeddings.shape) == 1:
+                    new_embeddings = new_embeddings.reshape(1, -1)
+                
+                # Update cache
+                for text, embedding in zip(uncached_texts, new_embeddings):
+                    text_hash = self._get_text_hash(text)
+                    self._embedding_cache[text_hash] = embedding.tolist()
+                
+                # Combine with cached embeddings
+                if cached_embeddings:
+                    all_embeddings = [None] * len(texts)
+                    for text, idx in text_to_idx.items():
+                        text_hash = self._get_text_hash(text)
+                        all_embeddings[idx] = self._embedding_cache[text_hash]
+                    return all_embeddings
+                
+                return new_embeddings.tolist()
+                
+            return cached_embeddings
             
         except Exception as e:
             logger.error(f"Failed to generate embeddings: {e}")
@@ -220,9 +280,47 @@ class VectorService:
     def process_document_for_vectors(
         self,
         document_id: str,
-        chunks: List[Dict[str, Any]],
-        document_metadata: Dict[str, Any]
+        text: str,
+        document_metadata: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
+        """
+        Process a document into vector-ready chunks with metadata.
+        
+        Args:
+            document_id: Unique document identifier
+            text: Document text content
+            document_metadata: Additional document metadata
+            
+        Returns:
+            List of vectors ready for upsert
+        """
+        # Process document into chunks
+        chunks = self.document_processor.process_document(
+            document_id=document_id,
+            text=text,
+            document_metadata=document_metadata
+        )
+        
+        # Generate embeddings for chunks
+        chunk_texts = [chunk['text'] for chunk in chunks]
+        chunk_embeddings = self.generate_embeddings(chunk_texts)
+        
+        # Prepare vectors for Pinecone
+        vectors = []
+        for chunk, embedding in zip(chunks, chunk_embeddings):
+            vector_id = f"{document_id}_{chunk['metadata']['chunk_index']}"
+            
+            vectors.append({
+                'id': vector_id,
+                'values': embedding,
+                'metadata': {
+                    **chunk['metadata'],
+                    'text': chunk['text'],
+                    'processed_at': datetime.utcnow().isoformat()
+                }
+            })
+            
+        return vectors
         """
         Process document chunks into vector format for Pinecone.
         
@@ -368,5 +466,25 @@ class VectorService:
             return []
 
 
-# Global vector service instance
-vector_service = VectorService()
+# Global vector service instance with LRU cache for embeddings
+class CachedVectorService(VectorService):
+    def __init__(self):
+        super().__init__()
+        self._embedding_cache = {}
+        
+    def clear_cache(self):
+        """Clear the embedding cache."""
+        self._embedding_cache.clear()
+        
+    def get_cache_info(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        return {
+            'cache_size': len(self._embedding_cache),
+            'cache_memory_usage': sum(
+                len(str(key)) + sum(len(str(v)) for v in value)
+                for key, value in self._embedding_cache.items()
+            )
+        }
+
+# Initialize the vector service with caching
+vector_service = CachedVectorService()
