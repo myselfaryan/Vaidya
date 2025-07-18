@@ -55,15 +55,38 @@ class Settings(BaseSettings):
     pinecone_environment: str = Field(..., description="Pinecone environment")
     pinecone_index_name: str = "vaidya-medical-knowledge"
     
-    # Medical Processing
-    max_chunk_size: int = 1000
+    # Document Processing
+    chunk_size: int = 1000
     chunk_overlap: int = 200
+    max_chunk_size_bytes: int = 1000000  # 1MB
+    min_chunk_size_chars: int = 50
+    max_chunk_size_chars: int = 2000
+    
+    # Embedding Settings
+    embedding_model: str = "text-embedding-3-small"
+    embedding_batch_size: int = 32
+    
+    # Vector Search
     max_retrieval_results: int = 5
     similarity_threshold: float = 0.7
+    
+    # Caching
+    enable_embedding_cache: bool = True
+    max_embedding_cache_size: int = 10000
+    cache_ttl_seconds: int = 86400  # 24 hours
     
     # File Upload
     max_file_size: int = 50 * 1024 * 1024  # 50MB
     allowed_file_types: List[str] = [".pdf", ".docx", ".txt", ".md"]
+    max_documents_per_user: int = 1000
+    
+    # Text Processing
+    max_text_length: int = 1000000  # ~1M characters
+    min_text_length: int = 10
+    
+    # Document Metadata
+    required_metadata_fields: List[str] = ["title", "source"]
+    optional_metadata_fields: List[str] = ["author", "publish_date", "language"]
     
     # WebSocket
     websocket_ping_interval: int = 30
