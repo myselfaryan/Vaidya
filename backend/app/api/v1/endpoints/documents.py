@@ -2,10 +2,12 @@
 Medical documents management endpoints for uploading, processing, and searching medical literature.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Union
 from uuid import UUID
-from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File, BackgroundTasks, Form, Query, Body
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func, and_, or_, desc, asc
 from loguru import logger
 
 from app.core.database import get_db
@@ -13,39 +15,60 @@ from app.models.schemas import (
     DocumentUpload, DocumentResponse, DocumentSearch,
     PaginatedResponse, PaginationParams
 )
-from app.models.models import MedicalDocument, DocumentChunk, DocumentType
-from app.services.ai_service import ai_service
+from app.models.models import MedicalDocument, DocumentChunk, DocumentType, DocumentStatus, User
+from app.schemas.document import DocumentStatistics
+from app.core.config import settings
+from app.services.document_service import document_service
+import os
+from datetime import datetime, timedelta, timezone
+import json
 from app.services.vector_service import vector_service
+from app.services.ai_service import ai_service
 from app.dependencies.auth import get_current_user, get_admin_user
 
 
 router = APIRouter()
 
 
-@router.post("/upload", response_model=DocumentResponse)
+@router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_202_ACCEPTED)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     document_data: DocumentUpload = Depends(),
-    admin_user = Depends(get_admin_user),
+    current_user = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> DocumentResponse:
     """
-    Upload and process a medical document (admin only).
+    Upload and process a medical document.
     
     Args:
+        background_tasks: Background tasks manager
         file: Uploaded document file
         document_data: Document metadata
-        admin_user: Admin user
+        current_user: Current authenticated user
         db: Database session
         
     Returns:
-        Created document information
+        Accepted document information
     """
     try:
-        # Validate file type
+        # Check user's document quota
         from app.core.config import settings
         
-        if not any(file.filename.endswith(ext) for ext in settings.allowed_file_types):
+        # Admin users have no quota
+        if not current_user.is_admin:
+            doc_count = db.query(MedicalDocument).filter(
+                MedicalDocument.uploaded_by == current_user.id
+            ).count()
+            
+            if doc_count >= settings.max_documents_per_user:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Maximum document limit of {settings.max_documents_per_user} reached"
+                )
+        
+        # Validate file type
+        if not any(file.filename.lower().endswith(ext) for ext in settings.allowed_file_types):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"File type not allowed. Allowed types: {settings.allowed_file_types}"
@@ -63,45 +86,128 @@ async def upload_document(
             text_content = content.decode('utf-8')
         else:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unsupported file type"
-            )
-        
-        if not text_content or len(text_content.strip()) < 100:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Document content is too short or empty"
-            )
-        
-        # Create document record
-        document = MedicalDocument(
-            title=document_data.title,
-            authors=document_data.authors or [],
-            source=document_data.source,
-            document_type=document_data.document_type,
-            content=text_content,
-            keywords=document_data.keywords or [],
-            word_count=len(text_content.split()),
-            processed=False
         )
         
-        db.add(document)
-        db.commit()
-        db.refresh(document)
+        # Update document status in the background
+        background_tasks.add_task(
+            document_service._process_document_async,
+            document_id=document.id,
+            db=db
+        )
         
-        # Process document in background
-        await process_document_async(document.id, db)
+        return document
         
-        logger.info(f"Document uploaded and queued for processing: {document.id}")
-        return DocumentResponse.from_orm(document)
-        
-    except HTTPException:
-        raise
+    except ValueError as e:
+        logger.error(f"Validation error in document upload: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
     except Exception as e:
-        logger.error(f"Failed to upload document: {e}")
+        db.rollback()
+        logger.error(f"Error uploading document: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to upload document"
+            detail="Failed to process document"
+        )
+
+
+@router.post("/batch/upload", response_model=List[DocumentResponse], status_code=status.HTTP_202_ACCEPTED)
+async def batch_upload_documents(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    batch_data: DocumentUpload = Depends(),
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> List[DocumentResponse]:
+    """
+    Upload and process multiple medical documents in a batch.
+    
+    Args:
+        background_tasks: Background tasks manager
+        files: List of uploaded document files
+        batch_data: Batch metadata
+        current_user: Current authenticated user
+        db: Database session
+        
+    Returns:
+        List of accepted document information
+    """
+    try:
+        # Check user's document quota
+        from app.core.config import settings
+        
+        # Admin users have no quota
+        if not current_user.is_admin:
+            doc_count = db.query(MedicalDocument).filter(
+                MedicalDocument.uploaded_by == current_user.id
+            ).count()
+            
+            if doc_count + len(files) > settings.max_documents_per_user:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Maximum document limit of {settings.max_documents_per_user} reached"
+                )
+        
+        # Validate file types
+        for file in files:
+            if not any(file.filename.lower().endswith(ext) for ext in settings.allowed_file_types):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"File type not allowed. Allowed types: {settings.allowed_file_types}"
+                )
+        
+        # Process each file
+        documents = []
+        for file in files:
+            # Read file content
+            content = await file.read()
+            
+            # Process based on file type
+            if file.filename.endswith('.pdf'):
+                text_content = extract_text_from_pdf(content)
+            elif file.filename.endswith('.docx'):
+                text_content = extract_text_from_docx(content)
+            elif file.filename.endswith('.txt'):
+                text_content = content.decode('utf-8')
+            else:
+                raise HTTPException(
+            )
+            
+            # Create document
+            document = MedicalDocument(
+                title=file.filename,
+                content=text_content,
+                uploaded_by=current_user.id,
+                metadata={"batch_id": batch_data.batch_id}
+            )
+            db.add(document)
+            db.commit()
+            db.refresh(document)
+            
+            # Update document status in the background
+            background_tasks.add_task(
+                document_service._process_document_async,
+                document_id=document.id,
+                db=db
+            )
+            
+            documents.append(DocumentResponse.from_orm(document))
+        
+        return documents
+        
+    except ValueError as e:
+        logger.error(f"Validation error in batch document upload: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error uploading batch documents: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process batch documents"
         )
 
 
@@ -109,6 +215,8 @@ async def upload_document(
 async def get_documents(
     pagination: PaginationParams = Depends(),
     document_type: Optional[DocumentType] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
     current_user = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> PaginatedResponse:
@@ -118,6 +226,8 @@ async def get_documents(
     Args:
         pagination: Pagination parameters
         document_type: Optional document type filter
+        status: Optional document status filter
+        search: Optional search query
         current_user: Current authenticated user
         db: Database session
         
@@ -128,16 +238,38 @@ async def get_documents(
         # Build query
         query = db.query(MedicalDocument)
         
+        # Apply filters
         if document_type:
             query = query.filter(MedicalDocument.document_type == document_type)
+        
+        # Filter by status if provided
+        if status:
+            query = query.filter(MedicalDocument.status == status)
+        
+        # Non-admin users can only see their own documents
+        if not current_user.is_admin:
+            query = query.filter(MedicalDocument.uploaded_by == current_user.id)
+        
+        # Apply search
+        if search:
+            search = f"%{search}%"
+            query = query.filter(
+                (MedicalDocument.title.ilike(search)) |
+                (MedicalDocument.description.ilike(search)) |
+                (MedicalDocument.content.ilike(search))
+            )
         
         # Get total count
         total = query.count()
         
-        # Get documents with pagination
-        documents = query.offset(
-            (pagination.page - 1) * pagination.size
-        ).limit(pagination.size).all()
+        # Apply pagination
+        documents = query.order_by(
+            MedicalDocument.updated_at.desc()
+        ).offset(
+            pagination.offset
+        ).limit(
+            pagination.limit
+        ).all()
         
         document_responses = [DocumentResponse.from_orm(doc) for doc in documents]
         
@@ -149,10 +281,164 @@ async def get_documents(
         )
         
     except Exception as e:
-        logger.error(f"Failed to get documents: {e}")
+        logger.error(f"Failed to get documents: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve documents"
+        )
+
+
+@router.get("/stats", response_model=DocumentStatistics)
+async def get_document_statistics(
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> JSONResponse:
+    """
+    Get comprehensive document statistics including counts by type, status, and storage usage.
+    
+    Args:
+        current_user: Current authenticated user
+        db: Database session
+        
+    Returns:
+        JSON response with document statistics
+    """
+    try:
+        # Base query with access control
+        base_query = db.query(MedicalDocument)
+        if not current_user.is_admin:
+            base_query = base_query.filter(MedicalDocument.uploaded_by == current_user.id)
+        
+        # Get total document count
+        total_documents = base_query.count()
+        
+        # Get document count by type
+        type_stats = base_query.with_entities(
+            MedicalDocument.document_type,
+            func.count(MedicalDocument.id).label('count')
+        ).group_by(MedicalDocument.document_type).all()
+        
+        # Get document count by status
+        status_stats = base_query.with_entities(
+            MedicalDocument.status,
+            func.count(MedicalDocument.id).label('count')
+        ).group_by(MedicalDocument.status).all()
+        
+        # Calculate storage usage (in bytes)
+        storage_usage = db.query(
+            func.sum(func.length(MedicalDocument.content))
+        ).scalar() or 0
+        
+        # Get recent activity
+        recent_activity = base_query.order_by(
+            MedicalDocument.updated_at.desc()
+        ).limit(5).all()
+        
+        # Get document type distribution
+        documents_by_type = [
+            {"type": doc_type, "count": count} 
+            for doc_type, count in type_stats
+        ]
+        
+        # Get status distribution
+        documents_by_status = [
+            {"status": status, "count": count} 
+            for status, count in status_stats
+        ]
+        
+        # Get recent documents
+        recent_docs = [
+            {
+                "id": str(doc.id),
+                "title": doc.title,
+                "type": doc.document_type.value,
+                "status": doc.status.value,
+                "updated_at": doc.updated_at.isoformat()
+            }
+            for doc in recent_activity
+        ]
+        
+        stats = {
+            "total_documents": total_documents,
+            "documents_by_type": documents_by_type,
+            "documents_by_status": documents_by_status,
+            "storage_usage": {
+                "bytes": storage_usage,
+                "mb": round(storage_usage / (1024 * 1024), 2),
+                "gb": round(storage_usage / (1024 * 1024 * 1024), 2)
+            },
+            "recent_activity": recent_docs
+        }
+        
+        return JSONResponse(content=stats)
+        
+    except Exception as e:
+        logger.error(f"Error getting document statistics: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve document statistics"
+        )
+
+
+@router.get("/batch/status/{batch_id}", response_model=Dict[str, Any])
+async def get_batch_status(
+    batch_id: str,
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Get the status of a batch document upload.
+    
+    Args:
+        batch_id: Batch ID to check status for
+        current_user: Current authenticated user
+        db: Database session
+        
+    Returns:
+        Batch status information
+    """
+    try:
+        # Query documents with the batch ID
+        query = db.query(MedicalDocument).filter(
+            MedicalDocument.metadata["batch_id"].astext == batch_id
+        )
+        
+        # Non-admin users can only see their own documents
+        if not current_user.is_admin:
+            query = query.filter(MedicalDocument.uploaded_by == current_user.id)
+        
+        documents = query.all()
+        
+        if not documents:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Batch not found or access denied"
+            )
+        
+        # Calculate status counts
+        status_counts = {}
+        for doc in documents:
+            status_counts[doc.status] = status_counts.get(doc.status, 0) + 1
+        
+        return {
+            "batch_id": batch_id,
+            "total_documents": len(documents),
+            "status_counts": status_counts,
+            "documents": [{
+                "id": str(doc.id),
+                "title": doc.title,
+                "status": doc.status,
+                "created_at": doc.created_at.isoformat(),
+                "processed_at": doc.processed_at.isoformat() if doc.processed_at else None,
+                "error": doc.error_message
+            } for doc in documents]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting batch status: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get batch status"
         )
 
 
@@ -189,58 +475,154 @@ async def get_document(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get document: {e}")
+        logger.error(f"Failed to get document: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve document"
         )
 
 
-@router.post("/search", response_model=List[DocumentResponse])
+@router.post("/search", response_model=List[DocumentSearchResult])
 async def search_documents(
     search_data: DocumentSearch,
     current_user = Depends(get_current_user),
     db: Session = Depends(get_db)
-) -> List[DocumentResponse]:
+) -> List[DocumentSearchResult]:
     """
-    Search medical documents using semantic search.
+    Search medical documents using hybrid search (semantic + keyword).
     
     Args:
-        search_data: Search parameters
+        search_data: Search parameters including query, filters, and pagination
         current_user: Current authenticated user
         db: Database session
         
     Returns:
-        List of relevant documents
+        List of matching documents with relevance scores and highlights
     """
     try:
-        # Perform semantic search
-        results = vector_service.search_medical_knowledge(
-            query=search_data.query,
-            document_types=[dt.value for dt in search_data.document_types] if search_data.document_types else None,
-            max_results=search_data.limit
-        )
+        # Base query with access control
+        query = db.query(MedicalDocument)
+        if not current_user.is_admin:
+            query = query.filter(MedicalDocument.uploaded_by == current_user.id)
         
-        # Get document IDs from results
-        document_ids = []
-        for result in results:
-            doc_id = result.get('metadata', {}).get('document_id')
-            if doc_id and doc_id not in document_ids:
-                document_ids.append(doc_id)
+        # Initialize results list
+        results = []
         
-        # Fetch documents from database
-        documents = db.query(MedicalDocument).filter(
-            MedicalDocument.id.in_(document_ids)
-        ).all()
+        # If we have a search query, perform hybrid search
+        if search_data.query:
+            # Perform semantic search if enabled
+            if settings.enable_semantic_search:
+                try:
+                    # Get semantic search results from vector store
+                    semantic_results = vector_service.search_similar(
+                        query_text=search_data.query,
+                        top_k=search_data.limit or 20,
+                        namespace="medical-docs"
+                    )
+                    
+                    # Get document IDs from semantic search
+                    semantic_doc_ids = {result['metadata']['document_id'] for result in semantic_results}
+                    semantic_scores = {result['metadata']['document_id']: result['score'] for result in semantic_results}
+                    
+                    # Get documents from database
+                    docs = query.filter(MedicalDocument.id.in_([UUID(doc_id) for doc_id in semantic_doc_ids])).all()
+                    
+                    # Create search results with semantic scores
+                    for doc in docs:
+                        doc_id = str(doc.id)
+                        results.append(DocumentSearchResult(
+                            document=DocumentResponse.from_orm(doc),
+                            score=semantic_scores.get(doc_id, 0.0),
+                            highlights={
+                                "content": [search_data.query],  # Simple highlight for now
+                                "title": [search_data.query] if search_data.query.lower() in doc.title.lower() else []
+                            }
+                        ))
+                    
+                    # If we have enough results, return them
+                    if len(results) >= (search_data.limit or 20):
+                        return results[:search_data.limit] if search_data.limit else results
+                        
+                except Exception as e:
+                    logger.warning(f"Semantic search failed, falling back to keyword search: {str(e)}")
+            
+            # Fall back to keyword search
+            search_terms = f"%{search_data.query}%"
+            keyword_conditions = [
+                MedicalDocument.title.ilike(search_terms),
+                MedicalDocument.content.ilike(search_terms),
+                MedicalDocument.metadata['keywords'].astext.ilike(search_terms)
+            ]
+            
+            # Get keyword search results
+            keyword_docs = query.filter(or_(*keyword_conditions)).all()
+            
+            # Add keyword results that aren't already in results
+            existing_ids = {str(r.document.id) for r in results}
+            for doc in keyword_docs:
+                if str(doc.id) not in existing_ids:
+                    results.append(DocumentSearchResult(
+                        document=DocumentResponse.from_orm(doc),
+                        score=0.5,  # Lower score for keyword matches
+                        highlights={
+                            "content": [search_data.query],
+                            "title": [search_data.query] if search_data.query.lower() in doc.title.lower() else []
+                        }
+                    ))
+        else:
+            # No search query, just apply filters and sorting
+            docs = query.all()
+            results = [
+                DocumentSearchResult(
+                    document=DocumentResponse.from_orm(doc),
+                    score=0.0
+                )
+                for doc in docs
+            ]
         
-        # Sort documents by relevance (order of appearance in search results)
-        document_dict = {str(doc.id): doc for doc in documents}
-        sorted_documents = [document_dict[doc_id] for doc_id in document_ids if doc_id in document_dict]
+        # Apply filters
+        if search_data.document_type:
+            results = [r for r in results if r.document.document_type == search_data.document_type]
+            
+        if search_data.status:
+            results = [r for r in results if r.document.status == search_data.status]
         
-        return [DocumentResponse.from_orm(doc) for doc in sorted_documents]
+        # Apply date range filter
+        if search_data.start_date:
+            results = [r for r in results if r.document.created_at >= search_data.start_date]
+        if search_data.end_date:
+            results = [r for r in results if r.document.created_at <= search_data.end_date]
+        
+        # Sort results by score (descending) and then by the requested field
+        sort_field = search_data.sort_by if search_data.sort_by != 'score' else None
+        reverse_sort = search_data.sort_order == "desc"
+        
+        def get_sort_key(result):
+            key = []
+            # Primary sort by score (descending)
+            key.append(-result.score if result.score is not None else 0)
+            
+            # Secondary sort by requested field
+            if sort_field and hasattr(result.document, sort_field):
+                field_value = getattr(result.document, sort_field)
+                # Handle None values for proper sorting
+                key.append(field_value is None)
+                key.append(field_value)
+            
+            # Tertiary sort by document ID for stability
+            key.append(result.document.id)
+            return tuple(key)
+        
+        results.sort(key=get_sort_key, reverse=reverse_sort)
+        
+        # Apply pagination
+        start = search_data.offset or 0
+        end = start + (search_data.limit or len(results)) if search_data.limit else len(results)
+        
+        return results[start:end]
         
     except Exception as e:
-        logger.error(f"Failed to search documents: {e}")
+        logger.error(f"Error searching documents: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to search documents"
