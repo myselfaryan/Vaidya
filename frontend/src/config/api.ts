@@ -2,34 +2,70 @@
  * API configuration for the Vaidya medical chatbot frontend
  */
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+// API Configuration
+type Environment = 'development' | 'production';
+
+// Fallback for process.env in case @types/node is not installed
+declare const process: {
+  env: {
+    NODE_ENV?: 'development' | 'production';
+    REACT_APP_API_URL?: string;
+  };
+};
+
+const ENV: Environment = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+
+const API_CONFIG = {
+  development: {
+    baseUrl: process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1',
+    timeout: 30000, // 30 seconds
+  },
+  production: {
+    baseUrl: process.env.REACT_APP_API_URL || 'https://api.vaidya.com/api/v1',
+    timeout: 60000, // 1 minute
+  },
+} as const;
+
+export const API_BASE_URL = API_CONFIG[ENV].baseUrl;
+export const API_TIMEOUT = API_CONFIG[ENV].timeout;
 
 export const API_ENDPOINTS = {
   // Authentication
-  LOGIN: `${API_BASE_URL}/api/v1/auth/login`,
-  LOGOUT: `${API_BASE_URL}/api/v1/auth/logout`,
-  REFRESH: `${API_BASE_URL}/api/v1/auth/refresh`,
+  AUTH: {
+    LOGIN: `${API_BASE_URL}/auth/login`,
+    LOGOUT: `${API_BASE_URL}/auth/logout`,
+    REFRESH: `${API_BASE_URL}/auth/refresh`,
+    REGISTER: `${API_BASE_URL}/auth/register`,
+  },
   
-  // User management
-  REGISTER: `${API_BASE_URL}/api/v1/users/register`,
-  USER_PROFILE: `${API_BASE_URL}/api/v1/users/me`,
-  USER_STATS: `${API_BASE_URL}/api/v1/users/me/stats`,
+  // User
+  USER: {
+    PROFILE: `${API_BASE_URL}/user/profile`,
+    PREFERENCES: `${API_BASE_URL}/user/preferences`,
+  },
   
-  // Chat and medical queries
-  MEDICAL_QUERY: `${API_BASE_URL}/api/v1/chat/query`,
-  CONVERSATIONS: `${API_BASE_URL}/api/v1/chat/conversations`,
-  SYMPTOM_ANALYSIS: `${API_BASE_URL}/api/v1/chat/symptoms/analyze`,
-  EMERGENCY_INFO: `${API_BASE_URL}/api/v1/chat/emergency`,
-  
-  // WebSocket
-  WEBSOCKET: `ws://localhost:8000/api/v1/ws/chat`,
-  
-  // Health
-  HEALTH: `${API_BASE_URL}/health`,
+  // Chat
+  CHAT: {
+    QUERY: `${API_BASE_URL}/chat/query`,
+    CONVERSATIONS: `${API_BASE_URL}/chat/conversations`,
+    MESSAGES: (conversationId: string) => `${API_BASE_URL}/chat/conversations/${conversationId}/messages`,
+  },
   
   // Documents
-  DOCUMENTS: `${API_BASE_URL}/api/v1/documents`,
-  DOCUMENT_SEARCH: `${API_BASE_URL}/api/v1/documents/search`,
+  DOCUMENTS: {
+    UPLOAD: `${API_BASE_URL}/documents/upload`,
+    LIST: `${API_BASE_URL}/documents`,
+    GET: (documentId: string) => `${API_BASE_URL}/documents/${documentId}`,
+    DELETE: (documentId: string) => `${API_BASE_URL}/documents/${documentId}`,
+    SEARCH: `${API_BASE_URL}/documents/search`,
+  },
+  
+  // Medical
+  MEDICAL: {
+    SYMPTOMS: `${API_BASE_URL}/medical/symptoms`,
+    CONDITIONS: `${API_BASE_URL}/medical/conditions`,
+    EMERGENCY: `${API_BASE_URL}/medical/emergency`,
+  },
 };
 
 export const APP_CONFIG = {
