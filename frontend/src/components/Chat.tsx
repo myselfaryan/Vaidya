@@ -4,22 +4,7 @@ import { toast } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 import MessageBubble from './MessageBubble';
 import LoadingSpinner from './LoadingSpinner';
-
-// Mock implementation - replace with actual API call
-const uploadDocument = async (formData: FormData, onProgress: (progressEvent: ProgressEvent) => void): Promise<any> => {
-  return new Promise((resolve) => {
-    // Simulate API call
-    setTimeout(() => {
-      const progressEvent = {
-        loaded: 100,
-        total: 100,
-      } as unknown as ProgressEvent;
-      
-      onProgress(progressEvent);
-      resolve({ success: true });
-    }, 1500);
-  });
-};
+import { apiService } from '../services/apiService';
 
 interface Message {
   id: string;
@@ -78,22 +63,24 @@ const Chat: FC<ChatProps> = (): ReactElement => {
     }
   };
 
-  const uploadFile = async (): Promise<any> => {
+  const uploadFile = async (): Promise<void> => {
     if (!selectedFile) return;
 
     setIsUploading(true);
     setUploadProgress(0);
 
     try {
-      const formData = new FormData();
-      formData.append('file', selectedFile);
-      
-      const response = await uploadDocument(formData, (progressEvent) => {
-        const progress = Math.round(
-          (progressEvent.loaded * 100) / (progressEvent.total || 1)
-        );
-        setUploadProgress(progress);
-      });
+      await apiService.uploadDocument(
+        selectedFile,
+        (progressEvent: ProgressEvent) => {
+          if (progressEvent.lengthComputable) {
+            const progress = Math.round(
+              (progressEvent.loaded * 100) / progressEvent.total
+            );
+            setUploadProgress(progress);
+          }
+        }
+      );
 
       toast.success('Document uploaded successfully!');
       removeFile();
@@ -108,15 +95,16 @@ const Chat: FC<ChatProps> = (): ReactElement => {
       };
       
       setMessages(prev => [...prev, systemMessage]);
-      return response;
     } catch (error) {
       console.error('Error uploading file:', error);
-      toast.error('Failed to upload document. Please try again.');
+      const errorMessage = error instanceof Error ? error.message : 'Failed to upload document';
+      toast.error(`Error: ${errorMessage}`);
       throw error;
     } finally {
       setIsUploading(false);
       setUploadProgress(0);
     }
+  };
   };
 
   const sendMessage = async (): Promise<void> => {
@@ -133,60 +121,47 @@ const Chat: FC<ChatProps> = (): ReactElement => {
 
     // If there's a message to send, send it
     if (inputMessage.trim()) {
+      const userMessage: Message = {
+        id: Date.now().toString(),
+        content: inputMessage,
+        isFromUser: true,
+        timestamp: new Date(),
+        type: 'user'
+      };
 
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      content: inputMessage,
-      isFromUser: true,
-      timestamp: new Date(),
-    };
+      setMessages(prev => [...prev, userMessage]);
+      setInputMessage('');
+      setIsLoading(true);
 
-    setMessages(prev => [...prev, userMessage]);
-    setInputMessage('');
-    setIsLoading(true);
-
-    try {
-      // Simulate API call to backend
-      const response = await fetch('/api/v1/chat/query', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('access_token')}`,
-        },
-        body: JSON.stringify({
-          question: inputMessage,
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
+      try {
+        const response = await apiService.sendMessage(inputMessage);
         
         const aiMessage: Message = {
           id: (Date.now() + 1).toString(),
-          content: data.answer,
+          content: response.data.answer || response.data.message || 'I received your message.',
           isFromUser: false,
           timestamp: new Date(),
-          confidence: data.confidence,
-          sources: data.sources,
+          confidence: response.data.confidence,
+          sources: response.data.sources,
+          type: 'assistant'
         };
 
         setMessages(prev => [...prev, aiMessage]);
-      } else {
-        throw new Error('Failed to get response');
-      }
-    } catch (error) {
-      console.error('Error sending message:', error);
-      
-      const errorMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        content: 'I apologize, but I\'m having trouble processing your request right now. Please try again later or consult with a healthcare professional.',
-        isFromUser: false,
-        timestamp: new Date(),
-      };
+      } catch (error) {
+        console.error('Error sending message:', error);
+        
+        const errorMessage: Message = {
+          id: (Date.now() + 1).toString(),
+          content: 'I apologize, but I\'m having trouble processing your request right now. Please try again later or consult with a healthcare professional.',
+          isFromUser: false,
+          timestamp: new Date(),
+          type: 'system'
+        };
 
-      setMessages(prev => [...prev, errorMessage]);
-    } finally {
-      setIsLoading(false);
+        setMessages(prev => [...prev, errorMessage]);
+      } finally {
+        setIsLoading(false);
+      }
     }
   };
 
