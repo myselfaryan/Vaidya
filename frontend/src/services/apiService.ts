@@ -2,13 +2,75 @@
  * API service for handling HTTP requests to the Vaidya backend
  */
 
-import { API_ENDPOINTS, APP_CONFIG } from '../config/api';
+import axios, { AxiosError, AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
+import { API_BASE_URL, API_TIMEOUT } from '../config/api';
+
+// Define response types
+export interface ApiResponse<T = any> {
+  data: T;
+  status: number;
+  statusText: string;
+}
+
+export interface ApiError {
+  message: string;
+  status?: number;
+  details?: any;
+}
+
+// Create axios instance with default config
+const api: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: API_TIMEOUT,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// Request interceptor for auth token
+api.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('access_token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// Response interceptor for error handling
+api.interceptors.response.use(
+  (response: AxiosResponse) => response,
+  (error: AxiosError) => {
+    if (error.response) {
+      // Server responded with a status code outside 2xx
+      const apiError: ApiError = {
+        message: (error.response.data as any)?.message || 'An error occurred',
+        status: error.response.status,
+        details: error.response.data,
+      };
+      return Promise.reject(apiError);
+    } else if (error.request) {
+      // Request was made but no response received
+      return Promise.reject({
+        message: 'No response from server. Please check your connection.',
+      });
+    } else {
+      // Something happened in setting up the request
+      return Promise.reject({
+        message: error.message || 'An error occurred',
+      });
+    }
+  }
+);
 
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   headers?: Record<string, string>;
   body?: any;
-  timeout?: number;
 }
 
 class ApiService {
@@ -16,12 +78,12 @@ class ApiService {
   private timeout: number;
 
   constructor() {
-    this.baseURL = API_ENDPOINTS.LOGIN.replace('/api/v1/auth/login', '');
-    this.timeout = APP_CONFIG.REQUEST_TIMEOUT;
+    this.baseURL = API_BASE_URL;
+    this.timeout = API_TIMEOUT;
   }
 
   private getAuthHeaders(): Record<string, string> {
-    const token = localStorage.getItem(APP_CONFIG.STORAGE_KEYS.ACCESS_TOKEN);
+    const token = localStorage.getItem('access_token');
     return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
@@ -30,75 +92,43 @@ class ApiService {
       method = 'GET',
       headers = {},
       body,
-      timeout = this.timeout
     } = options;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-
     try {
-      const response = await fetch(endpoint, {
+      const response = await api({
         method,
+        url: endpoint,
         headers: {
-          'Content-Type': 'application/json',
           ...this.getAuthHeaders(),
           ...headers,
         },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
+        data: body,
       });
 
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        if (response.status === 401) {
-          // Token expired, try to refresh
-          await this.refreshToken();
-          // Retry the request
-          return this.request(endpoint, options);
-        }
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      return await response.json();
+      return response.data;
     } catch (error) {
-      clearTimeout(timeoutId);
       throw error;
     }
   }
 
-  // Authentication
-  async login(credentials: { username: string; password: string }) {
-    const formData = new FormData();
-    formData.append('username', credentials.username);
-    formData.append('password', credentials.password);
-
-    const response = await fetch(API_ENDPOINTS.LOGIN, {
-      method: 'POST',
-      body: formData,
-    });
-
-    if (!response.ok) {
-      throw new Error('Login failed');
+  // Auth
+  async login(credentials: { username: string; password: string }): Promise<ApiResponse> {
+    try {
+      const response = await api.post('/auth/login', credentials);
+      return response;
+    } catch (error) {
+      throw error;
     }
-
-    const data = await response.json();
-    
-    // Store tokens
-    localStorage.setItem(APP_CONFIG.STORAGE_KEYS.ACCESS_TOKEN, data.access_token);
-    localStorage.setItem(APP_CONFIG.STORAGE_KEYS.REFRESH_TOKEN, data.refresh_token);
-    
-    return data;
   }
 
-  async logout() {
+  async logout(): Promise<void> {
     try {
-      await this.request(API_ENDPOINTS.LOGOUT, { method: 'POST' });
+      await this.request(API_BASE_URL + '/auth/logout', { method: 'POST' });
     } finally {
       // Clear local storage regardless of API response
-      localStorage.removeItem(APP_CONFIG.STORAGE_KEYS.ACCESS_TOKEN);
-      localStorage.removeItem(APP_CONFIG.STORAGE_KEYS.REFRESH_TOKEN);
-      localStorage.removeItem(APP_CONFIG.STORAGE_KEYS.USER_DATA);
+      localStorage.removeItem('access_token');
+      localStorage.removeItem('refresh_token');
+      localStorage.removeItem('user_data');
     }
   }
 
