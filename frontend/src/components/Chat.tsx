@@ -1,8 +1,25 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { PaperAirplaneIcon, MicrophoneIcon } from '@heroicons/react/24/solid';
+import React, { useState, useRef, useEffect, useCallback, FC, ReactElement } from 'react';
+import { PaperAirplaneIcon, PaperClipIcon, XMarkIcon } from '@heroicons/react/24/solid';
+import { toast } from 'react-toastify';
+import 'react-toastify/dist/ReactToastify.css';
 import MessageBubble from './MessageBubble';
 import LoadingSpinner from './LoadingSpinner';
-import Button from './Button';
+
+// Mock implementation - replace with actual API call
+const uploadDocument = async (formData: FormData, onProgress: (progressEvent: ProgressEvent) => void): Promise<any> => {
+  return new Promise((resolve) => {
+    // Simulate API call
+    setTimeout(() => {
+      const progressEvent = {
+        loaded: 100,
+        total: 100,
+      } as unknown as ProgressEvent;
+      
+      onProgress(progressEvent);
+      resolve({ success: true });
+    }, 1500);
+  });
+};
 
 interface Message {
   id: string;
@@ -11,9 +28,14 @@ interface Message {
   timestamp: Date;
   confidence?: number;
   sources?: any[];
+  type?: 'user' | 'assistant' | 'system';
 }
 
-const Chat: React.FC = () => {
+interface ChatProps {
+  // Add any props if needed
+}
+
+const Chat: FC<ChatProps> = (): ReactElement => {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: '1',
@@ -24,18 +46,93 @@ const Chat: React.FC = () => {
   ]);
   const [inputMessage, setInputMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const scrollToBottom = () => {
+  const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  }, []);
 
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
 
-  const sendMessage = async () => {
-    if (!inputMessage.trim()) return;
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>): void => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (file.size > 10 * 1024 * 1024) { // 10MB limit
+        toast.error('File size should be less than 10MB');
+        return;
+      }
+      setSelectedFile(file);
+    }
+  };
+
+  const removeFile = (): void => {
+    setSelectedFile(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const uploadFile = async (): Promise<any> => {
+    if (!selectedFile) return;
+
+    setIsUploading(true);
+    setUploadProgress(0);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      
+      const response = await uploadDocument(formData, (progressEvent) => {
+        const progress = Math.round(
+          (progressEvent.loaded * 100) / (progressEvent.total || 1)
+        );
+        setUploadProgress(progress);
+      });
+
+      toast.success('Document uploaded successfully!');
+      removeFile();
+      
+      // Add a system message about the upload
+      const systemMessage: Message = {
+        id: `doc-${Date.now()}`,
+        content: `Document "${selectedFile.name}" has been uploaded and processed.`,
+        isFromUser: false,
+        timestamp: new Date(),
+        type: 'system'
+      };
+      
+      setMessages(prev => [...prev, systemMessage]);
+      return response;
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      toast.error('Failed to upload document. Please try again.');
+      throw error;
+    } finally {
+      setIsUploading(false);
+      setUploadProgress(0);
+    }
+  };
+
+  const sendMessage = async (): Promise<void> => {
+    if (!inputMessage.trim() && !selectedFile) return;
+
+    // Handle file upload first if a file is selected
+    if (selectedFile) {
+      try {
+        await uploadFile();
+      } catch (error) {
+        return; // Error already handled in uploadFile
+      }
+    }
+
+    // If there's a message to send, send it
+    if (inputMessage.trim()) {
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -93,7 +190,7 @@ const Chat: React.FC = () => {
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -119,52 +216,105 @@ const Chat: React.FC = () => {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+          <MessageBubble
+            key={message.id}
+            message={{
+              id: message.id,
+              content: message.content,
+              isFromUser: message.isFromUser,
+              timestamp: message.timestamp,
+              confidence: message.confidence,
+              sources: message.sources
+            }}
+          />
         ))}
-        
-        {isLoading && (
-          <div className="flex justify-start">
-            <div className="bg-gray-100 text-gray-800 max-w-xs lg:max-w-md px-4 py-2 rounded-lg">
-              <LoadingSpinner size="small" message="Analyzing..." />
-            </div>
-          </div>
-        )}
-        
         <div ref={messagesEndRef} />
       </div>
 
       {/* Input */}
       <div className="border-t p-4">
+        {/* File upload preview */}
+        {selectedFile && (
+          <div className="flex items-center justify-between p-3 mb-2 bg-blue-50 rounded-lg">
+            <div className="flex items-center space-x-2">
+              <PaperClipIcon className="w-5 h-5 text-blue-500" />
+              <span className="text-sm text-gray-700 truncate max-w-xs">
+                {selectedFile.name}
+              </span>
+              <span className="text-xs text-gray-500">
+                {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+              </span>
+            </div>
+            <button
+              onClick={removeFile}
+              className="p-1 text-gray-400 rounded-full hover:text-gray-600 hover:bg-gray-100"
+              disabled={isUploading}
+            >
+              <XMarkIcon className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+        
+        {/* Upload progress */}
+        {isUploading && (
+          <div className="w-full mb-2 bg-gray-200 rounded-full h-1.5">
+            <div
+              className="h-1.5 rounded-full bg-blue-600 transition-all duration-300"
+              style={{ width: `${uploadProgress}%` }}
+            />
+          </div>
+        )}
+        
+        {/* Input area */}
         <div className="flex items-center space-x-2">
-          <textarea
-            value={inputMessage}
-            onChange={(e) => setInputMessage(e.target.value)}
-            onKeyPress={handleKeyPress}
-            placeholder="Ask me about your health concerns..."
-            className="flex-1 border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
-            rows={1}
-            disabled={isLoading}
-          />
-          
+          <div className="relative flex-1">
+            <input
+              type="text"
+              value={inputMessage}
+              onChange={(e) => setInputMessage(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+              className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="Type your message..."
+              disabled={isLoading || isUploading}
+            />
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileChange}
+              className="hidden"
+              accept=".pdf,.docx,.txt"
+              disabled={isUploading}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading}
+              className="absolute right-2 top-1/2 transform -translate-y-1/2 p-1 text-gray-400 rounded-full hover:text-gray-600 hover:bg-gray-100"
+            >
+              <PaperClipIcon className="w-5 h-5" />
+            </button>
+          </div>
           <button
             onClick={sendMessage}
-            disabled={isLoading || !inputMessage.trim()}
-            className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={isLoading || isUploading || (!inputMessage.trim() && !selectedFile)}
+            className="flex items-center justify-center w-12 h-12 text-white bg-blue-500 rounded-full hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <PaperAirplaneIcon className="w-5 h-5" />
-          </button>
-          
-          <button
-            className="bg-gray-200 text-gray-700 p-2 rounded-lg hover:bg-gray-300"
-            title="Voice input (coming soon)"
-          >
-            <MicrophoneIcon className="w-5 h-5" />
+            {isLoading || isUploading ? (
+              <LoadingSpinner size="small" />
+            ) : (
+              <PaperAirplaneIcon className="w-5 h-5 transform rotate-90" />
+            )}
           </button>
         </div>
         
-        <div className="mt-2 text-xs text-gray-500">
-          Press Enter to send, Shift+Enter for new line
-        </div>
+        {/* File type hint */}
+        <p className="mt-1 text-xs text-gray-500">
+          Supports PDF, DOCX, TXT (Max 10MB)
+        </p>
+      </div>
+      
+      <div className="mt-2 text-xs text-gray-500">
+        Press Enter to send, Shift+Enter for new line
       </div>
     </div>
   );
